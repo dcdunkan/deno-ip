@@ -1,5 +1,6 @@
-import { Buffer } from "https://deno.land/std@0.147.0/node/buffer.ts";
-import { networkInterfaces } from "https://deno.land/std@0.147.0/node/os.ts";
+// @deno-types="npm:@types/node"
+import { Buffer } from "node:buffer";
+import { networkInterfaces } from "node:os";
 
 export function toBuffer(ip: string, buff?: Buffer, offset?: number): Buffer {
   offset = ~~offset!;
@@ -315,12 +316,22 @@ export function isEqual(aStr: string, bStr: string) {
 }
 
 export function isPrivate(addr: string) {
+  // check loopback addresses first
+  if (isLoopback(addr)) return true;
+  // ensure the ipv4 address is valid
+  if (!isV6Format(addr)) {
+    const ipl = normalizeToLong(addr);
+    if (ipl < 0) {
+      throw new Error("invalid ipv4 address");
+    }
+    // normalize the address for the private range checks that follow
+    addr = fromLong(ipl);
+  } // check private ranges
   return /^(::f{4}:)?10\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/i
     .test(addr) ||
     /^(::f{4}:)?192\.168\.([0-9]{1,3})\.([0-9]{1,3})$/i.test(addr) ||
     /^(::f{4}:)?172\.(1[6-9]|2\d|30|31)\.([0-9]{1,3})\.([0-9]{1,3})$/i
       .test(addr) ||
-    /^(::f{4}:)?127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/i.test(addr) ||
     /^(::f{4}:)?169\.254\.([0-9]{1,3})\.([0-9]{1,3})$/i.test(addr) ||
     /^f[cd][0-9a-f]{2}:/i.test(addr) ||
     /^fe80:/i.test(addr) ||
@@ -333,9 +344,15 @@ export function isPublic(addr: string) {
 }
 
 export function isLoopback(addr: string) {
+  // If addr is an IPv4 address in long integer form (no dots and no colons), convert it
+  if (!/\./.test(addr) && !/:/.test(addr)) {
+    addr = fromLong(Number(addr));
+  }
   return /^(::f{4}:)?127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/
     .test(addr) ||
-    /^fe80::1$/.test(addr) ||
+    /^0177\./.test(addr) ||
+    /^0x7f\./i.test(addr) ||
+    /^fe80::1$/i.test(addr) ||
     /^::1$/.test(addr) ||
     /^::$/.test(addr);
 }
@@ -352,8 +369,10 @@ export function address(name?: string, family?: string) {
   const interfaces = networkInterfaces();
 
   family = _normalizeFamily(family);
-  if (name && name !== "private" && name !== "public") {
-    const res = interfaces[name].filter((details) => {
+  if (
+    name && name !== "private" && name !== "public" && interfaces[name] != null
+  ) {
+    const res = interfaces[name]!.filter((details) => {
       const itemFamily = _normalizeFamily(details.family);
       return itemFamily === family;
     });
@@ -363,20 +382,22 @@ export function address(name?: string, family?: string) {
     return res[0].address;
   }
 
-  const all = Object.keys(interfaces).map((nic) => {
-    const addresses = interfaces[nic].filter((details) => {
-      details.family = _normalizeFamily(details.family) as "IPv4" | "IPv6";
-      if (details.family !== family || isLoopback(details.address)) {
-        return false;
-      }
-      if (!name) return true;
-      return name === "public"
-        ? isPublic(details.address)
-        : isPrivate(details.address);
-    });
+  const all = Object.keys(interfaces)
+    .filter((nic) => interfaces[nic] != null)
+    .map((nic) => {
+      const addresses = interfaces[nic]!.filter((details) => {
+        details.family = _normalizeFamily(details.family) as "IPv4" | "IPv6";
+        if (details.family !== family || isLoopback(details.address)) {
+          return false;
+        }
+        if (!name) return true;
+        return name === "public"
+          ? isPublic(details.address)
+          : isPrivate(details.address);
+      });
 
-    return addresses.length ? addresses[0].address : undefined;
-  }).filter(Boolean);
+      return addresses.length ? addresses[0].address : undefined;
+    }).filter(Boolean);
 
   return !all.length ? loopback(family) : all[0];
 }
@@ -392,4 +413,49 @@ export function toLong(ip: string) {
 
 export function fromLong(ipl: number) {
   return (`${ipl >>> 24}.${ipl >> 16 & 255}.${ipl >> 8 & 255}.${ipl & 255}`);
+}
+
+export function normalizeToLong(addr: string) {
+  const parts = addr.split(".").map((part) => {
+    // Handle hexadecimal format
+    if (part.startsWith("0x") || part.startsWith("0X")) {
+      return parseInt(part, 16);
+    } // Handle octal format (strictly digits 0-7 after a leading zero)
+    else if (part.startsWith("0") && part !== "0" && /^[0-7]+$/.test(part)) {
+      return parseInt(part, 8);
+    } // Handle decimal format, reject invalid leading zeros
+    else if (/^[1-9]\d*$/.test(part) || part === "0") {
+      return parseInt(part, 10);
+    } // Return NaN for invalid formats to indicate parsing failure
+    else {
+      return NaN;
+    }
+  });
+
+  if (parts.some(isNaN)) return -1; // Indicate error with -1
+
+  let val = 0;
+  const n = parts.length;
+
+  switch (n) {
+    case 1:
+      val = parts[0];
+      break;
+    case 2:
+      if (parts[0] > 0xff || parts[1] > 0xffffff) return -1;
+      val = (parts[0] << 24) | (parts[1] & 0xffffff);
+      break;
+    case 3:
+      if (parts[0] > 0xff || parts[1] > 0xff || parts[2] > 0xffff) return -1;
+      val = (parts[0] << 24) | (parts[1] << 16) | (parts[2] & 0xffff);
+      break;
+    case 4:
+      if (parts.some((part) => part > 0xff)) return -1;
+      val = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+      break;
+    default:
+      return -1; // Error case
+  }
+
+  return val >>> 0;
 }
